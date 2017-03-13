@@ -21,8 +21,9 @@ from __future__ import unicode_literals
 import re
 
 # third party libs
-import pyPluribus.exceptions
-from pyPluribus import PluribusDevice
+from netmiko import ConnectHandler
+from netmiko.ssh_exception import NetMikoTimeoutException
+from netmiko.ssh_exception import NetMikoAuthenticationException
 
 # NAPALM base
 import napalm_base.helpers
@@ -44,57 +45,143 @@ class PluribusDriver(NetworkDriver):
         self.username = username
         self.password = password
         self.timeout = timeout
-
         if optional_args is None:
             optional_args = {}
-        self.port = optional_args.get('port', 22)
-
-        self.device = PluribusDevice(hostname, username, password, self.port, timeout)
+        self.connection_args = {
+            'device_type': 'pluribus',
+            'ip': hostname,
+            'username': username,
+            'password': password,
+            'timeout': timeout
+        }
+        self.connection_args.update(optional_args)
+        self.device = None
+        self.connected = False
+        self._last_working_config = ''
+        self._config_changed = False
+        self._committed = False
+        self._config_history = []
 
     def open(self):
         try:
-            self.device.open()
-        except pyPluribus.exceptions.ConnectionError as connerr:
-            raise napalm_base.exceptions.ConnectionException(connerr.message)
+            self.device = ConnectHandler(**self.connection_args)
+            self.connected = True
+            self._download_initial_config()
+        except NetMikoTimeoutException as t_err:
+            raise napalm_base.exceptions.ConnectionException(t_err.args[0])
+        except NetMikoAuthenticationException as au_err:
+            raise napalm_base.exceptions.ConnectionException(au_err.args[0])
 
     def is_alive(self):
         return{
-            'is_alive': self.device._connection.transport.is_alive()
+            'is_alive': self.connected and self.device.remote_conn.transport.is_alive()
         }
 
     def close(self):
-        self.device.close()
+        self.device.disconnect()
+
+    def _download_initial_config(self):
+        """Loads the initial config."""
+        _initial_config = self._download_running_config()  # this is a bit slow!
+        self._last_working_config = _initial_config
+        self._config_history.append(_initial_config)
+        self._config_history.append(_initial_config)
+
+    def _download_running_config(self):
+        """Downloads the running config from the switch."""
+        return self._show('running config')
+
+    def _upload_config_content(self, configuration):
+        """Will try to upload a specific configuration on the device."""
+        for configuration_line in configuration.splitlines():
+            out = self.device.send_command(configuration_line)
+            if 'Unrecognized command' in out:
+                raise napalm_base.exceptions.MergeConfigException(out)
+        self._config_changed = True  # configuration was changed
+        self._committed = False  # and not committed yet
 
     def load_merge_candidate(self, filename=None, config=None):
-        return self.device.config.load_candidate(filename=filename, config=config)
+        if filename is None:
+            configuration = config
+        else:
+            with open(filename) as config_file:
+                configuration = config_file.read()
+        return self._upload_config_content(configuration)
 
     def compare_config(self):
-        return self.device.config.compare()
+        running_config = self._download_running_config()
+        running_config_lines = running_config.splitlines()
+        last_committed_config = self._last_working_config
+        last_committed_config_lines = last_committed_config.splitlines()
+        difference = difflib.unified_diff(running_config_lines, last_committed_config_lines, n=3)
+        return '\n'.join(difference)
 
     def commit_config(self):
-        return self.device.config.commit()
+        if self._config_changed:
+            self._last_working_config = self._download_running_config()
+            self._config_history.append(self._last_working_config)
+            self._committed = True  # comfiguration was committed
+            self._config_changed = False  # no changes since last commit :)
+            return True  # this will be always true
+            # since the changes are automatically applied
+        self._committed = False  # make sure the _committed attribute is not True by any chance
+        return False  # nothing to commit
+
+    def _rollback(self, number=0):
+        available_configs = len(self._config_history)
+        max_rollbacks = available_configs - 2
+        config_location = 1
+        # will load the initial config worst case (user never commited, but wants to discard)
+        if max_rollbacks > 0:
+            # in case of previous commit(s) will be able to load a specific configuration
+            config_location = available_configs - number - 1
+            # stored in location len() - rollabck_nb - 1
+            # covers also the case of discard uncommitted changes (rollback 0)
+        desired_config = self._config_history[config_location]
+        self._upload_config_content(desired_config, rollbacked=True)
+        del self._config_history[(config_location+1):]
+        # delete all newer configurations than the config rolled back
+        self._last_working_config = desired_config
+        self._committed = True
+        self._config_changed = False
+        return True
 
     def discard_config(self):
-        return self.device.config.discard()
+        return self._rollback(number=0)
 
     def rollback(self):
-        return self.device.config.rollback(number=1)
+        return self._rollback(number=1)
+
+    def _execute_show(self, command, delim=';'):
+        if not delim or delim is None:
+            delim = ';'
+        format_command = '{command} parsable-delim {delim}'.format(
+            command=command,
+            delim=delim
+        )
+        return self.device.send_command(format_command)
+
+    def _show(self, command, delim=';'):
+        if not command.endswith('-show'):
+            command += '-show'
+        command = command.replace(' ', '-')
+        return self._execute_show(command, delim)
 
     def get_facts(self):
 
-        switch_info = self.device.show('switch info', delim='@$@')
+        switch_info = self._show('switch info', delim='@$@')
         lines = switch_info.splitlines()[1:4]
 
         hostname = lines[0].split('@$@')[1].strip()
         model = lines[1].split('@$@')[1].strip()
         serial = lines[2].split('@$@')[1].strip()
 
-        software_info = self.device.show('software', delim='@$@')
+        software_info = self._show('software', delim='@$@')
         lines = software_info.splitlines()[1:2]
 
         os_ver = lines[0].split('@$@')[1].strip()
 
-        system_stats = self.device.show('system stats', delim='@$@')
+        system_stats = self._show('system stats', delim='@$@')
         # one single line
 
         uptime_str = system_stats.split('@$@')[9].strip()
@@ -107,7 +194,7 @@ class PluribusDriver(NetworkDriver):
         uptime = 24*3600*uptime_days + 60*uptime_minutes + uptime_seconds
 
         interfaces = []
-        port_stats = self.device.show('port stats', delim='@$@')
+        port_stats = self._show('port stats', delim='@$@')
         lines = port_stats.splitlines()[1:-1]
 
         for line in lines:
@@ -143,7 +230,7 @@ class PluribusDriver(NetworkDriver):
 
         interfaces = {}
 
-        interface_info = self.device.show('port config', delim='@$@')
+        interface_info = self._show('port config', delim='@$@')
         interfaces_lines = interface_info.splitlines()[1:-1]
 
         for line in interfaces_lines:
@@ -174,7 +261,7 @@ class PluribusDriver(NetworkDriver):
 
         mac_table = []
 
-        mac_show = self.device.show('l2 table', delim='@$@')
+        mac_show = self._show('l2 table', delim='@$@')
         lines = mac_show.splitlines()[1:-1]
 
         for line in lines:
@@ -200,7 +287,7 @@ class PluribusDriver(NetworkDriver):
 
         lldp_neighbors = {}
 
-        lldp_show = self.device.show('lldp', delim='@$@')
+        lldp_show = self._show('lldp', delim='@$@')
         lines = lldp_show.splitlines()[1:-1]
 
         for line in lines:
@@ -221,7 +308,7 @@ class PluribusDriver(NetworkDriver):
 
         lldp_neighbors = {}
 
-        lldp_show = self.device.show('lldp', delim='@$@')
+        lldp_show = self._show('lldp', delim='@$@')
         lines = lldp_show.splitlines()[1:-1]
 
         for line in lines:
@@ -261,7 +348,7 @@ class PluribusDriver(NetworkDriver):
 
         ntp_stats = []
 
-        sw_setup_show = self.device.show('switch setup', delim='@$@')
+        sw_setup_show = self._show('switch setup', delim='@$@')
         ntp_server = py23_compat.text_type(sw_setup_show.splitlines()[9].split('@$@')[-1])
 
         ntp_stats.append({
@@ -289,7 +376,7 @@ class PluribusDriver(NetworkDriver):
             'read-only': u'ro'
         }
 
-        switch_info = self.device.show('switch info', delim='@$@')
+        switch_info = self._show('switch info', delim='@$@')
         chassis_id = switch_info.splitlines()[2].split('@$@')[-1]
 
         snmp_information['chassis_id'] = py23_compat.text_type(chassis_id)
@@ -297,7 +384,7 @@ class PluribusDriver(NetworkDriver):
         snmp_information['location'] = u''
         snmp_information['community'] = {}
 
-        snmp_communities = self.device.show('snmp community', delim='@$@')
+        snmp_communities = self._show('snmp community', delim='@$@')
         snmp_lines = snmp_communities.splitlines()
 
         for snmp_line in snmp_lines:
@@ -323,7 +410,7 @@ class PluribusDriver(NetworkDriver):
         }
 
         role_level = {}
-        roles_config = self.device.show('role', delim='@$@')
+        roles_config = self._show('role', delim='@$@')
         for role in roles_config.splitlines():
             role_details = role.split('@$@')
             role_name = role_details[2]
@@ -459,7 +546,7 @@ class PluribusDriver(NetworkDriver):
         }  # default values
 
         if retrieve.lower() in ['running', 'all']:
-            config['running'] = py23_compat.text_type(self.device.show('running config'))
+            config['running'] = py23_compat.text_type(self._show('running config'))
             # no startup as pluribus is WYSIWYG, no commit needed
 
         return config

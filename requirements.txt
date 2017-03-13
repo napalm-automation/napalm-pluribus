@@ -1,3 +1,2 @@
 napalm-base>=0.18.0
-netaddr
-pyPluribus
+netmiko
